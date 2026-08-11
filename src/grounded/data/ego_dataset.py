@@ -44,7 +44,7 @@ import numpy as np
 if TYPE_CHECKING:
     from grounded.data.processing import AssetDownload, EpisodeDownload
 
-try:  # torch is a declared dependency of the SDK, but hand-only readers can live without it
+try:  # Keep compatibility with downstream torch DataLoaders without requiring torch.
     from torch.utils.data import Dataset
 except ImportError:  # pragma: no cover
     Dataset = object

@@ -289,6 +289,24 @@ def test_download_episode_can_require_published_sha256(tmp_path: Path) -> None:
     assert transport.downloads == []
 
 
+def test_download_episode_rejects_checksum_mismatch_and_removes_partial_file(tmp_path: Path) -> None:
+    contract, objects = _episode_contract()
+    contract["episode"]["lanes"][0]["files"][0]["sha256"] = "0" * 64
+    transport = _MemoryTransport(objects)
+    client = ProcessingClient(episode_resolver=JsonEpisodeResolver(contract))
+
+    with pytest.raises(ProcessingError, match="SHA-256 mismatch"):
+        client.download_episode(
+            contract["episode"]["episode_id"],
+            lane="hand",
+            target_dir=str(tmp_path),
+            transport=transport,
+        )
+
+    assert not list(tmp_path.rglob("*.part"))
+    assert not list(tmp_path.rglob("left_front.mp4"))
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
