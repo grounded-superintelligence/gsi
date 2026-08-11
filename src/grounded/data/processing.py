@@ -14,6 +14,8 @@ from numbers import Integral
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Optional, Protocol
 
+from grounded.data._http import json_request, open_json_response
+
 ASSET_CONTRACT_VERSION = "grounded.asset.v1alpha1"
 ASSET_LIST_CONTRACT_VERSION = "grounded.asset-list.v1alpha1"
 ERROR_CONTRACT_VERSION = "grounded.error.v1alpha1"
@@ -688,9 +690,11 @@ class HttpAssetResolver:
 
     def _request_json(self, request: urllib.request.Request, *, context: str) -> tuple[Mapping[str, Any], int]:
         try:
-            with self._open(request, timeout=self.timeout_seconds) as response:
-                payload = json.load(response)
-                status_code = int(getattr(response, "status", 0) or 0)
+            payload, status_code = open_json_response(
+                request,
+                opener=self._open,
+                timeout_seconds=self.timeout_seconds,
+            )
         except urllib.error.HTTPError as exc:
             code = ""
             message = f"asset API returned HTTP {exc.code}"
@@ -727,15 +731,12 @@ class HttpAssetResolver:
         method: str = "GET",
         payload: Optional[Mapping[str, Any]] = None,
     ) -> urllib.request.Request:
-        headers = {"Accept": "application/json", "User-Agent": "grounded-python-sdk"}
-        body = None
-        if payload is not None:
-            body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(url, data=body, headers=headers, method=method)
-        if self.bearer_token:
-            request.add_header("Authorization", f"Bearer {self.bearer_token}")
-        return request
+        return json_request(
+            url,
+            bearer_token=self.bearer_token,
+            method=method,
+            payload=payload,
+        )
 
     def asset(self, asset_id: str) -> AssetRecord:
         normalized_asset_id = _required_text(asset_id, field_name="asset_id")
@@ -835,16 +836,16 @@ class HttpEpisodeResolver:
 
     def episode(self, episode_id: str) -> EpisodeRecord:
         quoted_id = urllib.parse.quote(_required_text(episode_id, field_name="episode_id"), safe="")
-        request = urllib.request.Request(
+        request = json_request(
             f"{self.base_url}/v1/episodes/{quoted_id}",
-            headers={"Accept": "application/json", "User-Agent": "grounded-python-sdk"},
-            method="GET",
+            bearer_token=self.bearer_token,
         )
-        if self.bearer_token:
-            request.add_header("Authorization", f"Bearer {self.bearer_token}")
         try:
-            with self._open(request, timeout=self.timeout_seconds) as response:
-                payload = json.load(response)
+            payload, _ = open_json_response(
+                request,
+                opener=self._open,
+                timeout_seconds=self.timeout_seconds,
+            )
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 raise EpisodeNotFoundError(f"episode not found: {episode_id}") from exc
@@ -1054,32 +1055,15 @@ class ProcessingClient:
                 lane_root = cache_root / _cache_component(lane_state.lane, visible_chars=16)
                 for episode_file in lane_state.files:
                     destination = lane_root / Path(episode_file.relative_path)
-                    destination.parent.mkdir(parents=True, exist_ok=True)
                     expected_sha = episode_file.sha256
-                    if require_sha256 and not expected_sha:
-                        raise ProcessingError(
-                            f"episode {episode_id} {lane_state.lane} file "
-                            f"{episode_file.relative_path} has no published SHA-256"
-                        )
-                    if not _local_file_matches(
-                        destination,
-                        size_bytes=episode_file.size_bytes,
-                        sha256=expected_sha,
-                    ):
-                        temporary = destination.with_name(f".{destination.name}.part")
-                        if temporary.exists():
-                            temporary.unlink()
-                        try:
-                            downloader.download(episode_file.uri, temporary)
-                            _validate_download(
-                                temporary,
-                                size_bytes=episode_file.size_bytes,
-                                sha256=expected_sha,
-                            )
-                            temporary.replace(destination)
-                        finally:
-                            if temporary.exists():
-                                temporary.unlink()
+                    actual_sha = _download_exact_file(
+                        artifact_file=episode_file,
+                        destination=destination,
+                        downloader=downloader,
+                        expected_sha=expected_sha,
+                        require_sha256=require_sha256,
+                        context=f"episode {episode_id} {lane_state.lane}",
+                    )
                     result_file = DownloadedEpisodeFile(
                         episode_id=episode_id,
                         asset_id=episode.asset_id,
@@ -1087,7 +1071,7 @@ class ProcessingClient:
                         source_uri=episode_file.uri,
                         local_path=str(destination),
                         size_bytes=destination.stat().st_size,
-                        sha256=_sha256_file(destination),
+                        sha256=actual_sha,
                         size_verified=episode_file.size_bytes is not None,
                         sha256_verified=bool(expected_sha),
                     )
@@ -1192,23 +1176,15 @@ class ProcessingClient:
                 raise ProcessingError(f"asset {asset_id} {artifact.lane} run {artifact.run_id} has no exact artifact files")
             for asset_file in files:
                 destination = cache_root / _cache_component(artifact.lane, visible_chars=16) / Path(asset_file.relative_path)
-                destination.parent.mkdir(parents=True, exist_ok=True)
                 expected_sha = asset_file.sha256 or (artifact.checksum_sha256 if len(files) == 1 else "")
-                if require_sha256 and not expected_sha:
-                    raise ProcessingError(
-                        f"asset {asset_id} {artifact.lane} file {asset_file.relative_path} has no published SHA-256"
-                    )
-                if not _local_file_matches(destination, size_bytes=asset_file.size_bytes, sha256=expected_sha):
-                    temporary = destination.with_name(f".{destination.name}.part")
-                    if temporary.exists():
-                        temporary.unlink()
-                    try:
-                        downloader.download(asset_file.uri, temporary)
-                        _validate_download(temporary, size_bytes=asset_file.size_bytes, sha256=expected_sha)
-                        temporary.replace(destination)
-                    finally:
-                        if temporary.exists():
-                            temporary.unlink()
+                actual_sha = _download_exact_file(
+                    artifact_file=asset_file,
+                    destination=destination,
+                    downloader=downloader,
+                    expected_sha=expected_sha,
+                    require_sha256=require_sha256,
+                    context=f"asset {asset_id} {artifact.lane}",
+                )
                 downloaded.append(
                     DownloadedAssetFile(
                         asset_id=asset_id,
@@ -1217,7 +1193,7 @@ class ProcessingClient:
                         source_uri=asset_file.uri,
                         local_path=str(destination),
                         size_bytes=destination.stat().st_size,
-                        sha256=_sha256_file(destination),
+                        sha256=actual_sha,
                         size_verified=asset_file.size_bytes is not None,
                         sha256_verified=bool(expected_sha),
                     )
@@ -1342,6 +1318,34 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _download_exact_file(
+    *,
+    artifact_file: AssetFile,
+    destination: Path,
+    downloader: ArtifactTransport,
+    expected_sha: str,
+    require_sha256: bool,
+    context: str,
+) -> str:
+    """Populate one cache entry atomically and return its actual SHA-256."""
+
+    if require_sha256 and not expected_sha:
+        raise ProcessingError(f"{context} file {artifact_file.relative_path} has no published SHA-256")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not _local_file_matches(destination, size_bytes=artifact_file.size_bytes, sha256=expected_sha):
+        temporary = destination.with_name(f".{destination.name}.part")
+        if temporary.exists():
+            temporary.unlink()
+        try:
+            downloader.download(artifact_file.uri, temporary)
+            _validate_download(temporary, size_bytes=artifact_file.size_bytes, sha256=expected_sha)
+            temporary.replace(destination)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+    return _sha256_file(destination)
 
 
 def _local_file_matches(path: Path, *, size_bytes: Optional[int], sha256: str) -> bool:
