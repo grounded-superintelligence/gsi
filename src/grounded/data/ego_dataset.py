@@ -81,7 +81,7 @@ class HandPose:
 
     side: str  # "left" | "right"
     keypoints3d: np.ndarray  # (21, 3) float32, MANO-21 joints
-    vertices: np.ndarray  # (778, 3) float32, MANO mesh vertices
+    vertices: Optional[np.ndarray]  # (778, 3) float32 MANO mesh vertices, when published
     global_orient: np.ndarray  # (3, 3) float32, root rotation
     transl: np.ndarray  # (3,) float32, root translation (== wrist)
     hand_pose: np.ndarray  # (15, 3, 3) float32, articulated joint rotations
@@ -713,13 +713,14 @@ class HandEpisode(Dataset):
 
         with np.load(filepath, allow_pickle=True) as d:
             sides = [str(s) for s in d["sides"]]
+            vertices = d["vertices"] if "vertices" in d.files else None
             for row, side in enumerate(sides):
                 if side not in SIDES:
                     continue
                 pose = HandPose(
                     side=side,
                     keypoints3d=np.asarray(d["keypoints3d"][row], dtype=np.float32),
-                    vertices=np.asarray(d["vertices"][row], dtype=np.float32),
+                    vertices=(np.asarray(vertices[row], dtype=np.float32) if vertices is not None else None),
                     global_orient=np.asarray(d["global_orients"][row], dtype=np.float32),
                     transl=np.asarray(d["transls"][row], dtype=np.float32),
                     hand_pose=np.asarray(d["hand_poses"][row], dtype=np.float32),
