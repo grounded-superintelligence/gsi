@@ -26,22 +26,23 @@ SOURCE_FRAME_START = 100
 SOURCE_FRAME_END = 102
 
 
-def _write_pose(path: Path, source_frame: int) -> None:
-    np.savez(
-        path,
-        sides=np.asarray(["left"]),
-        keypoints3d=np.full((1, 21, 3), source_frame, dtype=np.float32),
-        vertices=np.full((1, 778, 3), source_frame, dtype=np.float32),
-        global_orients=np.eye(3, dtype=np.float32)[None, ...],
-        transls=np.asarray([[source_frame, 0, 1]], dtype=np.float32),
-        hand_poses=np.repeat(np.eye(3, dtype=np.float32)[None, None, ...], 15, axis=1),
-        betas=np.zeros((1, 10), dtype=np.float32),
-        source_views=np.asarray(["left_front"]),
-        inlier_masks=np.ones((1, 4, 21), dtype=bool),
-        is_detected=np.asarray([True]),
-        reasons=np.asarray([""]),
-        hand_frame_idxs=np.asarray([source_frame]),
-    )
+def _write_pose(path: Path, source_frame: int, *, include_vertices: bool = True) -> None:
+    values = {
+        "sides": np.asarray(["left"]),
+        "keypoints3d": np.full((1, 21, 3), source_frame, dtype=np.float32),
+        "global_orients": np.eye(3, dtype=np.float32)[None, ...],
+        "transls": np.asarray([[source_frame, 0, 1]], dtype=np.float32),
+        "hand_poses": np.repeat(np.eye(3, dtype=np.float32)[None, None, ...], 15, axis=1),
+        "betas": np.zeros((1, 10), dtype=np.float32),
+        "source_views": np.asarray(["left_front"]),
+        "inlier_masks": np.ones((1, 4, 21), dtype=bool),
+        "is_detected": np.asarray([True]),
+        "reasons": np.asarray([""]),
+        "hand_frame_idxs": np.asarray([source_frame]),
+    }
+    if include_vertices:
+        values["vertices"] = np.full((1, 778, 3), source_frame, dtype=np.float32)
+    np.savez(path, **values)
 
 
 def _build_flat_hand_lane(tmp_path: Path, *, malicious_member: bool = False) -> Path:
@@ -113,7 +114,12 @@ def _build_flat_hand_lane(tmp_path: Path, *, malicious_member: bool = False) -> 
     return lane_dir
 
 
-def _build_full_hand_archive(tmp_path: Path, *, malicious_member: bool = False) -> Path:
+def _build_full_hand_archive(
+    tmp_path: Path,
+    *,
+    malicious_member: bool = False,
+    include_vertices: bool = True,
+) -> Path:
     hand_dir = tmp_path / "full_hand_source"
     params_dir = hand_dir / "pose_interpolation" / "params"
     save_dataset_dir = hand_dir / "save_dataset"
@@ -121,7 +127,11 @@ def _build_full_hand_archive(tmp_path: Path, *, malicious_member: bool = False) 
     save_dataset_dir.mkdir(parents=True)
 
     for frame_index in range(2):
-        _write_pose(params_dir / f"frame_{frame_index:06d}.npz", frame_index)
+        _write_pose(
+            params_dir / f"frame_{frame_index:06d}.npz",
+            frame_index,
+            include_vertices=include_vertices,
+        )
     camera_values = {}
     for camera in ("left_front", "right_front", "left_eye", "right_eye"):
         camera_values[f"K_{camera}"] = np.eye(3, dtype=np.float32)
@@ -303,6 +313,18 @@ def test_full_asset_download_opens_entire_hand_segment(tmp_path: Path) -> None:
     assert episode[1].left_hand is not None
     assert episode[1].left_hand.hand_frame_idx == 1
     assert Path(episode.session_dir).is_relative_to(Path(download.root_dir))
+
+
+def test_full_asset_supports_h3_pose_files_without_mesh_vertices(tmp_path: Path) -> None:
+    archive_path = _build_full_hand_archive(tmp_path, include_vertices=False)
+    download = _asset_download(archive_path, tmp_path / "asset_cache")
+
+    episode = HandEpisode.from_asset_download(download, segment=2, active_cameras=[])
+    hand = episode[1].left_hand
+
+    assert hand is not None
+    assert hand.vertices is None
+    assert hand.keypoints3d.shape == (21, 3)
 
 
 def test_full_asset_extraction_is_content_cached(tmp_path: Path) -> None:
