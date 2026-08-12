@@ -378,7 +378,7 @@ def _visualize_hand_episode_to_mp4(
     downsample: int = 2,
     fps: Optional[float] = None,
     grid_cols: int = 2,
-    show_invalid: bool = True,
+    show_invalid: bool = False,
     num_workers: int = 1,
     preset: str = "medium",
     caption: Optional[str] = None,
