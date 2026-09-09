@@ -8,11 +8,13 @@ or materialize the final dataset.
 Until a signed release tag is published, install the exact tested commit:
 
 ```bash
+git clone https://github.com/grounded-superintelligence/gsi.git grounded-sdk
+cd grounded-sdk
+git checkout --detach 118208f5bec2792b0ee2b3e08230f2bc53efe41c
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install \
-  "git+https://github.com/grounded-superintelligence/grounded.git@118208f5bec2792b0ee2b3e08230f2bc53efe41c"
+python -m pip install .
 ```
 
 The delivery consists of a local `grounded.episode.v1alpha1` JSON manifest,
@@ -50,7 +52,7 @@ bytes.
 
 ## Render one episode
 
-From an SDK source checkout:
+From that SDK source checkout:
 
 ```bash
 python demo.py \
