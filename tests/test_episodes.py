@@ -4,6 +4,7 @@ import copy
 import hashlib
 import io
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -96,6 +97,11 @@ class _MemoryTransport:
     def download(self, uri: str, target: Path) -> None:
         self.downloads.append(uri)
         target.write_bytes(self.objects[uri])
+
+
+class _OfflineTransport:
+    def download(self, uri: str, target: Path) -> None:
+        raise AssertionError(f"offline cache unexpectedly requested {uri}")
 
 
 def test_json_episode_resolver_preserves_identity_bounds_states_and_lineage() -> None:
@@ -198,6 +204,54 @@ def test_download_episode_defaults_to_all_lane_states_and_exact_existing_files(t
         assert Path(item.local_path).read_bytes() == objects[item.source_uri]
         assert item.size_verified
         assert item.sha256_verified
+
+
+def test_download_episode_reopens_verified_cache_without_network(tmp_path: Path) -> None:
+    contract, objects = _episode_contract()
+    client = ProcessingClient(episode_resolver=JsonEpisodeResolver(contract))
+    episode_id = contract["episode"]["episode_id"]
+
+    first = client.download_episode(
+        episode_id,
+        target_dir=str(tmp_path),
+        transport=_MemoryTransport(objects),
+        require_sha256=True,
+    )
+    second = client.download_episode(
+        episode_id,
+        target_dir=str(tmp_path),
+        transport=_OfflineTransport(),
+        require_sha256=True,
+    )
+
+    assert [(item.lane, item.sha256) for item in second.files] == [(item.lane, item.sha256) for item in first.files]
+
+
+def test_download_episode_cache_can_be_copied_and_reopened_offline(tmp_path: Path) -> None:
+    contract, objects = _episode_contract()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(contract), encoding="utf-8")
+    client = ProcessingClient.from_manifest(manifest)
+    episode_id = contract["episode"]["episode_id"]
+    source_cache = tmp_path / "source-cache"
+    portable_cache = tmp_path / "portable-cache"
+
+    client.download_episode(
+        episode_id,
+        target_dir=str(source_cache),
+        transport=_MemoryTransport(objects),
+        require_sha256=True,
+    )
+    shutil.copytree(source_cache, portable_cache)
+
+    reopened = ProcessingClient.from_manifest(manifest).download_episode(
+        episode_id,
+        target_dir=str(portable_cache),
+        transport=_OfflineTransport(),
+        require_sha256=True,
+    )
+
+    assert {Path(item.local_path).read_bytes() for item in reopened.files} == set(objects.values())
 
 
 def test_download_episode_requested_unprocessed_lane_returns_status_without_files(tmp_path: Path) -> None:
