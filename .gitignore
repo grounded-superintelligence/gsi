@@ -5,6 +5,7 @@ credentials
 *.jsonl
 *.mp4
 *.rrd
+/runs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
