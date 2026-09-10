@@ -18,6 +18,7 @@ ASSET_CONTRACT_VERSION = "grounded.asset.v1alpha1"
 ASSET_LIST_CONTRACT_VERSION = "grounded.asset-list.v1alpha1"
 ERROR_CONTRACT_VERSION = "grounded.error.v1alpha1"
 EPISODE_CONTRACT_VERSION = "grounded.episode.v1alpha1"
+EPISODE_VIEW_REVISION_VERSION = "grounded.episode-views.v1alpha1"
 PROCESS_REQUEST_CONTRACT_VERSION = "grounded.process-request.v1alpha1"
 PROCESS_RECEIPT_CONTRACT_VERSION = "grounded.process-receipt.v1alpha1"
 DEFAULT_ASSET_CACHE = "~/.cache/grounded/data"
@@ -31,6 +32,15 @@ EMPTY_ASSET_STATUSES = frozenset({"not_processed", "failed"})
 EPISODE_LANE_STATUSES = frozenset({"available", "partial", "not_processed", "failed"})
 DOWNLOADABLE_EPISODE_LANE_STATUSES = frozenset({"available", "partial"})
 REQUIRED_EPISODE_LANES = frozenset({"hand", "slam", "depth"})
+CORE_EPISODE_CAMERAS = ("left_front", "right_front", "left_eye", "right_eye")
+SIDE_EPISODE_CAMERAS = ("left_side", "right_side")
+SIX_EPISODE_CAMERAS = (*CORE_EPISODE_CAMERAS, *SIDE_EPISODE_CAMERAS)
+EPISODE_VIEW_SETS = {
+    "four_view": CORE_EPISODE_CAMERAS,
+    "six_view": SIX_EPISODE_CAMERAS,
+}
+EPISODE_VIEW_STATUSES = frozenset({"available", "partial", "failed"})
+EPISODE_CAMERA_STATUSES = frozenset({"available", "not_processed", "failed"})
 PROCESS_RECEIPT_STATES = frozenset({"accepted", "already_running", "already_available", "retry_required", "not_supported"})
 
 
@@ -56,6 +66,45 @@ def _expected_episode_id(*, asset_id: str, start_ns: Any, end_ns: Any) -> str:
     }
     canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return f"ep_v1_{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:32]}"
+
+
+def _expected_view_revision_id(
+    *,
+    episode_id: str,
+    view_set: str,
+    cameras: tuple[EpisodeCameraReference, ...],
+    calibration_lane: str,
+    calibration_relative_path: str,
+    calibration_sha256: str,
+    calibration_version_id: str,
+) -> str:
+    """Derive an immutable ID from exact media and calibration references."""
+
+    identity = {
+        "scheme": "grounded.episode-views.v1",
+        "episode_id": episode_id,
+        "view_set": view_set,
+        "cameras": [
+            {
+                "camera": camera.camera,
+                "status": camera.status,
+                "lane": camera.lane,
+                "relative_path": camera.relative_path,
+                "sha256": camera.sha256,
+                "size_bytes": camera.size_bytes,
+                "version_id": camera.version_id,
+            }
+            for camera in cameras
+        ],
+        "calibration": {
+            "lane": calibration_lane,
+            "relative_path": calibration_relative_path,
+            "sha256": calibration_sha256,
+            "version_id": calibration_version_id,
+        },
+    }
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return f"viewrev_v1_{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:32]}"
 
 
 def _cache_component(value: str, *, visible_chars: int) -> str:
@@ -117,6 +166,7 @@ class AssetFile:
     uri: str
     size_bytes: Optional[int] = None
     sha256: str = ""
+    version_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -200,6 +250,44 @@ class EpisodeLane:
 
 
 @dataclass(frozen=True)
+class EpisodeCameraReference:
+    """One camera's state in a versioned episode-view projection."""
+
+    camera: str
+    status: str
+    lane: str = ""
+    relative_path: str = ""
+    sha256: str = ""
+    size_bytes: Optional[int] = None
+    version_id: str = ""
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class EpisodeViewRevision:
+    """A verified four- or six-view projection of an unchanged episode."""
+
+    revision_id: str
+    view_set: str
+    status: str
+    required_cameras: tuple[str, ...]
+    cameras: tuple[EpisodeCameraReference, ...]
+    calibration_lane: str
+    calibration_relative_path: str
+    calibration_sha256: str
+    calibration_version_id: str = ""
+    provenance: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def available_cameras(self) -> tuple[str, ...]:
+        return tuple(camera.camera for camera in self.cameras if camera.status == "available")
+
+    @property
+    def is_data_ready(self) -> bool:
+        return self.status == "available" and self.available_cameras == self.required_cameras
+
+
+@dataclass(frozen=True)
 class EpisodeRecord:
     """One captioned interval within a parent asset."""
 
@@ -216,6 +304,7 @@ class EpisodeRecord:
     timebase: dict[str, Any] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    view_revision: Optional[EpisodeViewRevision] = None
 
 
 class AssetResolver(Protocol):
@@ -346,6 +435,7 @@ def _asset_file_from_mapping(value: Mapping[str, Any], *, strict: bool = False) 
         uri=_required_text(value.get("uri"), field_name="artifacts[].files[].uri"),
         size_bytes=size_bytes,
         sha256=sha256,
+        version_id=str(value.get("version_id") or ""),
     )
 
 
@@ -515,6 +605,154 @@ def _episode_lane_from_mapping(value: Mapping[str, Any]) -> EpisodeLane:
     )
 
 
+def _episode_view_revision_from_mapping(
+    value: Mapping[str, Any],
+    *,
+    episode_id: str,
+    lanes: tuple[EpisodeLane, ...],
+) -> EpisodeViewRevision:
+    if value.get("schema_version") != EPISODE_VIEW_REVISION_VERSION:
+        raise ProcessingError(
+            "unsupported episode view revision schema: "
+            f"{value.get('schema_version') or '<missing>'}"
+        )
+    view_set = _required_text(value.get("view_set"), field_name="view_revision.view_set").lower()
+    if view_set not in EPISODE_VIEW_SETS:
+        raise ProcessingError(f"unsupported episode view set: {view_set}")
+    expected_cameras = EPISODE_VIEW_SETS[view_set]
+    raw_required = value.get("required_cameras")
+    if not isinstance(raw_required, list) or any(not isinstance(item, str) for item in raw_required):
+        raise ProcessingError("episode view revision required_cameras must be a list of camera names")
+    required_cameras = tuple(raw_required)
+    if required_cameras != expected_cameras:
+        raise ProcessingError(
+            f"episode {view_set} revision must require cameras in canonical order: {list(expected_cameras)}"
+        )
+
+    lane_files = {
+        (lane.lane, file.relative_path): file
+        for lane in lanes
+        if lane.status in DOWNLOADABLE_EPISODE_LANE_STATUSES
+        for file in lane.files
+    }
+    raw_cameras = value.get("cameras")
+    if not isinstance(raw_cameras, list):
+        raise ProcessingError("episode view revision cameras must be a list")
+    cameras: list[EpisodeCameraReference] = []
+    for raw_camera in raw_cameras:
+        if not isinstance(raw_camera, Mapping):
+            raise ProcessingError("episode view revision camera entries must be objects")
+        camera = _required_text(raw_camera.get("camera"), field_name="view_revision.cameras[].camera").lower()
+        status = _required_text(raw_camera.get("status"), field_name="view_revision.cameras[].status").lower()
+        if camera not in expected_cameras:
+            raise ProcessingError(f"camera {camera!r} does not belong to episode view set {view_set}")
+        if status not in EPISODE_CAMERA_STATUSES:
+            raise ProcessingError(f"unsupported episode camera status: {status}")
+        lane = str(raw_camera.get("lane") or "").strip().lower()
+        raw_relative_path = raw_camera.get("relative_path")
+        relative_path = (
+            _safe_relative_path(raw_relative_path, field_name="view_revision.cameras[].relative_path", strict=True)
+            if raw_relative_path
+            else ""
+        )
+        if status == "available":
+            if not lane or not relative_path:
+                raise ProcessingError(f"available episode camera {camera} must reference an exact lane file")
+            try:
+                exact_file = lane_files[(lane, relative_path)]
+            except KeyError as exc:
+                raise ProcessingError(
+                    f"available episode camera {camera} references no downloadable lane file: {lane}/{relative_path}"
+                ) from exc
+            if not exact_file.sha256:
+                raise ProcessingError(f"available episode camera {camera} lane file must publish SHA-256")
+            camera_ref = EpisodeCameraReference(
+                camera=camera,
+                status=status,
+                lane=lane,
+                relative_path=relative_path,
+                sha256=exact_file.sha256,
+                size_bytes=exact_file.size_bytes,
+                version_id=exact_file.version_id,
+                message=str(raw_camera.get("message") or ""),
+            )
+        else:
+            if lane or relative_path:
+                raise ProcessingError(f"unavailable episode camera {camera} cannot reference a lane file")
+            camera_ref = EpisodeCameraReference(
+                camera=camera,
+                status=status,
+                message=str(raw_camera.get("message") or ""),
+            )
+        cameras.append(camera_ref)
+    if tuple(camera.camera for camera in cameras) != expected_cameras:
+        raise ProcessingError(
+            f"episode {view_set} revision must publish one state per camera in canonical order: {list(expected_cameras)}"
+        )
+
+    raw_calibration = value.get("calibration")
+    if not isinstance(raw_calibration, Mapping):
+        raise ProcessingError("episode view revision must reference calibration")
+    calibration_lane = _required_text(
+        raw_calibration.get("lane"), field_name="view_revision.calibration.lane"
+    ).lower()
+    calibration_relative_path = _safe_relative_path(
+        raw_calibration.get("relative_path"),
+        field_name="view_revision.calibration.relative_path",
+        strict=True,
+    )
+    try:
+        calibration_file = lane_files[(calibration_lane, calibration_relative_path)]
+    except KeyError as exc:
+        raise ProcessingError(
+            "episode view revision calibration references no downloadable lane file: "
+            f"{calibration_lane}/{calibration_relative_path}"
+        ) from exc
+    if not calibration_file.sha256:
+        raise ProcessingError("episode view revision calibration lane file must publish SHA-256")
+
+    derived_status = (
+        "available"
+        if all(camera.status == "available" for camera in cameras)
+        else "failed"
+        if any(camera.status == "failed" for camera in cameras)
+        else "partial"
+    )
+    status = _required_text(value.get("status"), field_name="view_revision.status").lower()
+    if status not in EPISODE_VIEW_STATUSES or status != derived_status:
+        raise ProcessingError(
+            f"episode view revision status must be {derived_status!r} for its published camera states"
+        )
+    camera_tuple = tuple(cameras)
+    expected_revision_id = _expected_view_revision_id(
+        episode_id=episode_id,
+        view_set=view_set,
+        cameras=camera_tuple,
+        calibration_lane=calibration_lane,
+        calibration_relative_path=calibration_relative_path,
+        calibration_sha256=calibration_file.sha256,
+        calibration_version_id=calibration_file.version_id,
+    )
+    revision_id = _required_text(value.get("revision_id"), field_name="view_revision.revision_id")
+    if revision_id != expected_revision_id:
+        raise ProcessingError(
+            "episode view revision ID does not match exact media references: "
+            f"expected {expected_revision_id}, got {revision_id}"
+        )
+    return EpisodeViewRevision(
+        revision_id=revision_id,
+        view_set=view_set,
+        status=status,
+        required_cameras=required_cameras,
+        cameras=camera_tuple,
+        calibration_lane=calibration_lane,
+        calibration_relative_path=calibration_relative_path,
+        calibration_sha256=calibration_file.sha256,
+        calibration_version_id=calibration_file.version_id,
+        provenance=dict(value.get("provenance") or {}),
+    )
+
+
 def _episode_from_mapping(value: Mapping[str, Any]) -> EpisodeRecord:
     raw_interval = value.get("interval")
     if not isinstance(raw_interval, Mapping):
@@ -565,12 +803,22 @@ def _episode_from_mapping(value: Mapping[str, Any]) -> EpisodeRecord:
     if segment is not None and segment < 0:
         raise ProcessingError("episode contract field must be non-negative: segment")
 
+    lane_tuple = tuple(lanes)
+    raw_view_revision = value.get("view_revision")
+    if raw_view_revision is not None and not isinstance(raw_view_revision, Mapping):
+        raise ProcessingError("episode contract field must be an object: view_revision")
+    view_revision = (
+        _episode_view_revision_from_mapping(raw_view_revision, episode_id=episode_id, lanes=lane_tuple)
+        if isinstance(raw_view_revision, Mapping)
+        else None
+    )
+
     return EpisodeRecord(
         episode_id=episode_id,
         asset_id=asset_id,
         start_ns=start_ns,
         end_ns=end_ns,
-        lanes=tuple(lanes),
+        lanes=lane_tuple,
         segment=segment,
         legacy_key=str(value.get("legacy_key") or ""),
         caption=str(value.get("caption") or ""),
@@ -579,6 +827,7 @@ def _episode_from_mapping(value: Mapping[str, Any]) -> EpisodeRecord:
         timebase=dict(value.get("timebase") or {}),
         provenance=dict(value.get("provenance") or {}),
         metadata=dict(value.get("metadata") or {}),
+        view_revision=view_revision,
     )
 
 
@@ -1008,6 +1257,20 @@ class ProcessingClient:
         if self.episode_resolver is None:
             raise ProcessingError("no episode resolver configured")
         return self.episode_resolver.episode(episode_id)
+
+    def get_episode_view_revision(self, episode_id: str) -> Optional[EpisodeViewRevision]:
+        """Return exact camera readiness, or ``None`` for an unlabeled legacy manifest."""
+
+        return self.get_episode(episode_id).view_revision
+
+    def is_episode_data_ready(self, episode_id: str, *, view_set: str = "six_view") -> bool:
+        """Report readiness only for an explicitly labeled, exact-file view revision."""
+
+        normalized_view_set = _required_text(view_set, field_name="view_set").lower()
+        if normalized_view_set not in EPISODE_VIEW_SETS:
+            raise ProcessingError(f"unsupported episode view set: {normalized_view_set}")
+        revision = self.get_episode_view_revision(episode_id)
+        return bool(revision and revision.view_set == normalized_view_set and revision.is_data_ready)
 
     def list_episode_lanes(self, episode_id: str) -> list[EpisodeLane]:
         """List every producer-published lane state for an episode."""

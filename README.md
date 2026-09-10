@@ -85,3 +85,7 @@ finally:
 See [`docs/ASSET_EPISODE_FLOW.md`](docs/ASSET_EPISODE_FLOW.md) for the complete
 asset and episode control flow, and [`docs/DATA.md`](docs/DATA.md) for the
 exact specification of every array the readers expose.
+
+Deliveries that add synchronized camera views without changing episode bounds
+can publish an additive view revision. See
+[`docs/EPISODE_VIEW_REVISIONS.md`](docs/EPISODE_VIEW_REVISIONS.md).
