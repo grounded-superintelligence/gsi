@@ -77,6 +77,10 @@ def _expected_view_revision_id(
     calibration_relative_path: str,
     calibration_sha256: str,
     calibration_version_id: str,
+    timebase_lane: str,
+    timebase_relative_path: str,
+    timebase_sha256: str,
+    timebase_version_id: str,
 ) -> str:
     """Derive an immutable ID from exact media and calibration references."""
 
@@ -93,6 +97,10 @@ def _expected_view_revision_id(
                 "sha256": camera.sha256,
                 "size_bytes": camera.size_bytes,
                 "version_id": camera.version_id,
+                "frame_count": camera.frame_count,
+                "projection_model": camera.projection_model,
+                "distortion_model": camera.distortion_model,
+                "calibration_key": camera.calibration_key,
             }
             for camera in cameras
         ],
@@ -101,6 +109,13 @@ def _expected_view_revision_id(
             "relative_path": calibration_relative_path,
             "sha256": calibration_sha256,
             "version_id": calibration_version_id,
+        },
+        "timebase": {
+            "clock": "sensor_ns",
+            "lane": timebase_lane,
+            "relative_path": timebase_relative_path,
+            "sha256": timebase_sha256,
+            "version_id": timebase_version_id,
         },
     }
     canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -260,6 +275,10 @@ class EpisodeCameraReference:
     sha256: str = ""
     size_bytes: Optional[int] = None
     version_id: str = ""
+    frame_count: Optional[int] = None
+    projection_model: str = ""
+    distortion_model: str = ""
+    calibration_key: str = ""
     message: str = ""
 
 
@@ -276,6 +295,10 @@ class EpisodeViewRevision:
     calibration_relative_path: str
     calibration_sha256: str
     calibration_version_id: str = ""
+    timebase_lane: str = ""
+    timebase_relative_path: str = ""
+    timebase_sha256: str = ""
+    timebase_version_id: str = ""
     provenance: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -666,6 +689,33 @@ def _episode_view_revision_from_mapping(
                 ) from exc
             if not exact_file.sha256:
                 raise ProcessingError(f"available episode camera {camera} lane file must publish SHA-256")
+            raw_frame_count = raw_camera.get("frame_count")
+            if not isinstance(raw_frame_count, int) or isinstance(raw_frame_count, bool) or raw_frame_count <= 0:
+                raise ProcessingError(f"available episode camera {camera} must publish a positive frame_count")
+            raw_geometry = raw_camera.get("geometry")
+            if not isinstance(raw_geometry, Mapping):
+                raise ProcessingError(f"available episode camera {camera} must publish geometry metadata")
+            projection_model = _required_text(
+                raw_geometry.get("projection_model"),
+                field_name=f"view_revision.cameras[{camera}].geometry.projection_model",
+            ).lower()
+            distortion_model = _required_text(
+                raw_geometry.get("distortion_model"),
+                field_name=f"view_revision.cameras[{camera}].geometry.distortion_model",
+            ).lower()
+            calibration_key = _required_text(
+                raw_geometry.get("calibration_key"),
+                field_name=f"view_revision.cameras[{camera}].geometry.calibration_key",
+            )
+            expected_projection = "source_original" if camera in SIDE_EPISODE_CAMERAS else "undistorted_pinhole"
+            if projection_model != expected_projection:
+                raise ProcessingError(
+                    f"episode camera {camera} projection_model must be {expected_projection!r}, got {projection_model!r}"
+                )
+            if projection_model == "undistorted_pinhole" and distortion_model != "none":
+                raise ProcessingError(f"undistorted episode camera {camera} must publish distortion_model 'none'")
+            if projection_model == "source_original" and distortion_model == "none":
+                raise ProcessingError(f"source-original episode camera {camera} must publish its distortion model")
             camera_ref = EpisodeCameraReference(
                 camera=camera,
                 status=status,
@@ -674,6 +724,10 @@ def _episode_view_revision_from_mapping(
                 sha256=exact_file.sha256,
                 size_bytes=exact_file.size_bytes,
                 version_id=exact_file.version_id,
+                frame_count=raw_frame_count,
+                projection_model=projection_model,
+                distortion_model=distortion_model,
+                calibration_key=calibration_key,
                 message=str(raw_camera.get("message") or ""),
             )
         else:
@@ -711,6 +765,27 @@ def _episode_view_revision_from_mapping(
     if not calibration_file.sha256:
         raise ProcessingError("episode view revision calibration lane file must publish SHA-256")
 
+    raw_timebase = value.get("timebase")
+    if not isinstance(raw_timebase, Mapping):
+        raise ProcessingError("episode view revision must reference an exact sensor-clock mapping")
+    if str(raw_timebase.get("clock") or "").lower() != "sensor_ns":
+        raise ProcessingError("episode view revision timebase clock must be sensor_ns")
+    timebase_lane = _required_text(raw_timebase.get("lane"), field_name="view_revision.timebase.lane").lower()
+    timebase_relative_path = _safe_relative_path(
+        raw_timebase.get("relative_path"),
+        field_name="view_revision.timebase.relative_path",
+        strict=True,
+    )
+    try:
+        timebase_file = lane_files[(timebase_lane, timebase_relative_path)]
+    except KeyError as exc:
+        raise ProcessingError(
+            "episode view revision timebase references no downloadable lane file: "
+            f"{timebase_lane}/{timebase_relative_path}"
+        ) from exc
+    if not timebase_file.sha256:
+        raise ProcessingError("episode view revision timebase lane file must publish SHA-256")
+
     derived_status = (
         "available"
         if all(camera.status == "available" for camera in cameras)
@@ -732,6 +807,10 @@ def _episode_view_revision_from_mapping(
         calibration_relative_path=calibration_relative_path,
         calibration_sha256=calibration_file.sha256,
         calibration_version_id=calibration_file.version_id,
+        timebase_lane=timebase_lane,
+        timebase_relative_path=timebase_relative_path,
+        timebase_sha256=timebase_file.sha256,
+        timebase_version_id=timebase_file.version_id,
     )
     revision_id = _required_text(value.get("revision_id"), field_name="view_revision.revision_id")
     if revision_id != expected_revision_id:
@@ -749,6 +828,10 @@ def _episode_view_revision_from_mapping(
         calibration_relative_path=calibration_relative_path,
         calibration_sha256=calibration_file.sha256,
         calibration_version_id=calibration_file.version_id,
+        timebase_lane=timebase_lane,
+        timebase_relative_path=timebase_relative_path,
+        timebase_sha256=timebase_file.sha256,
+        timebase_version_id=timebase_file.version_id,
         provenance=dict(value.get("provenance") or {}),
     )
 

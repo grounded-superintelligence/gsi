@@ -25,18 +25,35 @@ verified six-camera calibration object.
         "camera": "left_front",
         "status": "available",
         "lane": "hand",
-        "relative_path": "left_front.mp4"
+        "relative_path": "left_front.mp4",
+        "frame_count": 180,
+        "geometry": {
+          "projection_model": "undistorted_pinhole",
+          "distortion_model": "none",
+          "calibration_key": "left_front"
+        }
       },
       {
         "camera": "left_side",
         "status": "available",
         "lane": "side_camera",
-        "relative_path": "left_side.mp4"
+        "relative_path": "left_side.mp4",
+        "frame_count": 180,
+        "geometry": {
+          "projection_model": "source_original",
+          "distortion_model": "fisheye",
+          "calibration_key": "left_side"
+        }
       }
     ],
     "calibration": {
       "lane": "side_camera",
       "relative_path": "camera_params_six_view.npz"
+    },
+    "timebase": {
+      "clock": "sensor_ns",
+      "lane": "side_camera",
+      "relative_path": "side_sync_manifest.json"
     }
   }
 }
@@ -47,6 +64,13 @@ referenced lane file must publish its URI, byte size, SHA-256, and object
 version when available. The SDK rejects missing files, missing checksums,
 incorrect readiness labels, and revision IDs that do not match their exact
 references.
+
+Front and eye Hand exports are labeled `undistorted_pinhole`. Source-original
+side views retain their actual distortion model and calibration key. A side
+view is never projected with front-camera calibration, and the four-camera
+Hand-fit inlier mask is not treated as side-view evidence. The timebase object
+must map every view to the episode's absolute `sensor_ns` clock; FPS inference
+is not accepted.
 
 ```python
 client = ProcessingClient.from_manifest("episodes.json")
